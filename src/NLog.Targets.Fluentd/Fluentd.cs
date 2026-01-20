@@ -207,6 +207,8 @@ namespace NLog.Targets
 
         public bool IncludeAllProperties { get; set; }
 
+        public string AppName { get; set; }
+
         private TcpClient client;
 
         private Stream stream;
@@ -289,6 +291,9 @@ namespace NLog.Targets
                 { "message", Layout.Render(logEvent) },
                 { "logger_name", logEvent.LoggerName },
                 { "sequence_id", logEvent.SequenceID },
+                { "tag", this.Tag },
+                { "appName", this.AppName },
+                { "@timestamp", logEvent.TimeStamp.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.ffff") }
             };
             if (this.EmitStackTraceWhenAvailable && logEvent.HasStackTrace)
             {
