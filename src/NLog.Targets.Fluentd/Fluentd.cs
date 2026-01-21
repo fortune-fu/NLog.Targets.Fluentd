@@ -173,7 +173,7 @@ namespace NLog.Targets
         {
             this.destination = stream;
             this.packer = Packer.Create(destination);
-            var embeddedContext  = new SerializationContext(this.packer.CompatibilityOptions);
+            var embeddedContext = new SerializationContext(this.packer.CompatibilityOptions);
             embeddedContext.Serializers.Register(new OrdinaryDictionarySerializer(embeddedContext, null));
             this.serializationContext = new SerializationContext(PackerCompatibilityOptions.PackBinaryAsRaw);
             this.serializationContext.Serializers.Register(new OrdinaryDictionarySerializer(this.serializationContext, embeddedContext));
@@ -208,6 +208,8 @@ namespace NLog.Targets
         public bool IncludeAllProperties { get; set; }
 
         public string AppName { get; set; }
+
+        public bool UseTcpJson { get; set; }
 
         private TcpClient client;
 
@@ -250,7 +252,10 @@ namespace NLog.Targets
         {
             this.client.Connect(this.Host, this.Port);
             this.stream = this.client.GetStream();
-            this.emitter = new FluentdEmitter(this.stream);
+            if (!this.UseTcpJson)
+            {
+                this.emitter = new FluentdEmitter(this.stream);
+            }
         }
 
         protected void Cleanup()
@@ -285,6 +290,18 @@ namespace NLog.Targets
         }
 
         protected override void Write(LogEventInfo logEvent)
+        {
+            if (this.UseTcpJson)
+            {
+                WriteTcpJson(logEvent);
+            }
+            else
+            {
+                WriteMsgPack(logEvent);
+            }
+        }
+
+        private void WriteMsgPack(LogEventInfo logEvent)
         {
             var record = new Dictionary<string, object> {
                 { "level", logEvent.Level.Name },
@@ -322,6 +339,9 @@ namespace NLog.Targets
                     if (string.IsNullOrEmpty(propertyKey))
                         continue;
 
+                    if (record.ContainsKey(propertyKey))
+                        continue;
+
                     record[propertyKey] = SerializePropertyValue(propertyKey, property.Value);
                 }
             }
@@ -347,6 +367,103 @@ namespace NLog.Targets
             }
         }
 
+        private void WriteTcpJson(LogEventInfo logEvent)
+        {
+            var renderedMessage = Layout != null ? Layout.Render(logEvent) : logEvent.FormattedMessage;
+
+            object swCtxProperty;
+            object tidProperty;
+            object appNameProperty;
+
+            logEvent.Properties.TryGetValue("SW_CTX", out swCtxProperty);
+            logEvent.Properties.TryGetValue("TID", out tidProperty);
+            logEvent.Properties.TryGetValue("appName", out appNameProperty);
+
+            var swCtx = swCtxProperty != null ? swCtxProperty.ToString() : "N/A";
+            var tid = tidProperty != null ? tidProperty.ToString() : "N/A";
+            var appName = appNameProperty != null ? appNameProperty.ToString() : this.AppName;
+            var threadName = System.Threading.Thread.CurrentThread.Name;
+            if (string.IsNullOrEmpty(threadName))
+            {
+                threadName = System.Threading.Thread.CurrentThread.ManagedThreadId.ToString();
+            }
+
+            var levelValue = GetLevelValue(logEvent.Level);
+
+            var sb = new StringBuilder();
+            sb.Append("{");
+            sb.AppendFormat("\"@timestamp\":\"{0}\",", logEvent.TimeStamp.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"));
+            sb.Append("\"@version\":\"1\",");
+            sb.AppendFormat("\"hostname\":\"{0}\",", EscapeJson(Environment.MachineName));
+            sb.AppendFormat("\"appName\":\"{0}\",", EscapeJson(appName));
+            sb.AppendFormat("\"level\":\"{0}\",", logEvent.Level.Name.ToUpper());
+            sb.AppendFormat("\"level_value\":{0},", levelValue);
+            sb.AppendFormat("\"logger_name\":\"{0}\",", EscapeJson(logEvent.LoggerName));
+            sb.AppendFormat("\"thread_name\":\"{0}\",", EscapeJson(threadName));
+            sb.AppendFormat("\"message\":\"{0}\",", EscapeJson(renderedMessage));
+            sb.AppendFormat("\"sequence_id\":{0},", logEvent.SequenceID);
+            sb.AppendFormat("\"tag\":\"{0}\"", EscapeJson(this.Tag));
+
+            if (logEvent.Exception != null)
+            {
+                sb.AppendFormat(",\"stack_trace\":\"{0}\"", EscapeJson(logEvent.Exception.ToString()));
+            }
+            
+            // Append extra properties if needed
+            if (this.IncludeAllProperties && logEvent.Properties.Count > 0)
+            {
+                foreach (var property in logEvent.Properties)
+                {
+                    var propertyKey = property.Key.ToString();
+                    if (string.IsNullOrEmpty(propertyKey) || propertyKey == "appName")
+                        continue;
+
+                    sb.AppendFormat(",\"{0}\":\"{1}\"", EscapeJson(propertyKey), EscapeJson(property.Value?.ToString() ?? ""));
+                }
+            }
+
+            sb.Append("}\n"); // End JSON and add newline
+
+            try
+            {
+                EnsureConnected();
+                // Send JSON string as bytes
+                byte[] data = Encoding.UTF8.GetBytes(sb.ToString());
+                this.stream.Write(data, 0, data.Length);
+                this.stream.Flush();
+            }
+            catch (Exception ex)
+            {
+                NLog.Common.InternalLogger.Warn("Fluentd Emit TCP JSON - " + ex.ToString());
+                throw; 
+            }
+        }
+
+        private static string EscapeJson(string s)
+        {
+            if (s == null) return "";
+            // Basic JSON escaping
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
+        }
+
+
+        private static int GetLevelValue(LogLevel level)
+        {
+            if (level == LogLevel.Trace)
+                return 10000;
+            if (level == LogLevel.Debug)
+                return 20000;
+            if (level == LogLevel.Info)
+                return 20000;
+            if (level == LogLevel.Warn)
+                return 30000;
+            if (level == LogLevel.Error)
+                return 40000;
+            if (level == LogLevel.Fatal)
+                return 50000;
+            return 0;
+        }
+
         private static object SerializePropertyValue(string propertyKey, object propertyValue)
         {
             if (propertyValue == null || Convert.GetTypeCode(propertyValue) != TypeCode.Object || propertyValue is decimal)
@@ -370,6 +487,8 @@ namespace NLog.Targets
             this.LingerEnabled = true;
             this.LingerTime = 1000;
             this.EmitStackTraceWhenAvailable = false;
+            this.IncludeAllProperties = false;
+            this.UseTcpJson = false;
             this.Tag = Assembly.GetCallingAssembly().GetName().Name;
         }
     }

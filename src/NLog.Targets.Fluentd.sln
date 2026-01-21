@@ -12,6 +12,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Demo", "Demo\Demo.csproj", 
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "build", "build", "{3A0DCA05-3C95-45FA-8FAC-F0F636741AE4}"
 	ProjectSection(SolutionItems) = preProject
+		..\.gitignore = ..\.gitignore
 		..\build\nuget.ps1 = ..\build\nuget.ps1
 		..\build\publish-nuget.ps1 = ..\build\publish-nuget.ps1
 	EndProjectSection
