@@ -20,9 +20,9 @@ using System.IO;
 using System.Text;
 using System.Net.Sockets;
 using System.Diagnostics;
-using System.Reflection;
 using MsgPack;
 using MsgPack.Serialization;
+using NLog.Layouts;
 
 namespace NLog.Targets
 {
@@ -172,7 +172,7 @@ namespace NLog.Targets
         public FluentdEmitter(Stream stream)
         {
             this.destination = stream;
-            this.packer = Packer.Create(destination);
+            this.packer = Packer.Create(stream);
             var embeddedContext = new SerializationContext(this.packer.CompatibilityOptions);
             embeddedContext.Serializers.Register(new OrdinaryDictionarySerializer(embeddedContext, null));
             this.serializationContext = new SerializationContext(PackerCompatibilityOptions.PackBinaryAsRaw);
@@ -183,11 +183,11 @@ namespace NLog.Targets
     [Target("Fluentd")]
     public class Fluentd : NLog.Targets.TargetWithLayout
     {
-        public string Host { get; set; }
+        public Layout Host { get; set; }
 
         public int Port { get; set; }
 
-        public string Tag { get; set; }
+        public Layout Tag { get; set; }
 
         public bool NoDelay { get; set; }
 
@@ -207,10 +207,11 @@ namespace NLog.Targets
 
         public bool IncludeAllProperties { get; set; }
 
-        public string AppName { get; set; }
+        public Layout AppName { get; set; }
+
+        public Layout HostName { get; set; }
 
         public bool UseTcpJson { get; set; }
-
         private TcpClient client;
 
         private Stream stream;
@@ -250,7 +251,9 @@ namespace NLog.Targets
 
         private void ConnectClient()
         {
-            this.client.Connect(this.Host, this.Port);
+            string endPoint = RenderLogEvent(this.Host, LogEventInfo.CreateNullEvent());
+            NLog.Common.InternalLogger.Debug("Fluentd Connecting to {0}:{1}", endPoint, this.Port);
+            this.client.Connect(endPoint, this.Port);
             this.stream = this.client.GetStream();
             if (!this.UseTcpJson)
             {
@@ -303,15 +306,20 @@ namespace NLog.Targets
 
         private void WriteMsgPack(LogEventInfo logEvent)
         {
+            var appName = RenderLogEvent(this.AppName, logEvent);
+            var tagName = RenderLogEvent(this.Tag, logEvent);
+            var logMessage = RenderLogEvent(this.Layout, logEvent);
+
             var record = new Dictionary<string, object> {
                 { "level", logEvent.Level.Name },
-                { "message", Layout.Render(logEvent) },
+                { "message", logMessage },
                 { "logger_name", logEvent.LoggerName },
                 { "sequence_id", logEvent.SequenceID },
-                { "tag", this.Tag },
-                { "appName", this.AppName },
+                { "tag", tagName },
+                { "appName", appName },
                 { "@timestamp", logEvent.TimeStamp.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.ffff") }
             };
+
             if (this.EmitStackTraceWhenAvailable && logEvent.HasStackTrace)
             {
                 var transcodedFrames = new List<Dictionary<string, object>>();
@@ -331,18 +339,17 @@ namespace NLog.Targets
                 }
                 record.Add("stacktrace", transcodedFrames);
             }
-            if (this.IncludeAllProperties && logEvent.Properties.Count > 0)
+
+            if (this.IncludeAllProperties && logEvent.HasProperties)
             {
                 foreach (var property in logEvent.Properties)
                 {
                     var propertyKey = property.Key.ToString();
                     if (string.IsNullOrEmpty(propertyKey))
                         continue;
-
                     if (record.ContainsKey(propertyKey))
                         continue;
-
-                    record[propertyKey] = SerializePropertyValue(propertyKey, property.Value);
+                    record[propertyKey] = SerializePropertyValue(property.Value);
                 }
             }
 
@@ -358,7 +365,7 @@ namespace NLog.Targets
 
             try
             {
-                this.emitter?.Emit(logEvent.TimeStamp, this.Tag, record);
+                this.emitter?.Emit(logEvent.TimeStamp, tagName, record);
             }
             catch (Exception ex)
             {
@@ -369,7 +376,7 @@ namespace NLog.Targets
 
         private void WriteTcpJson(LogEventInfo logEvent)
         {
-            var renderedMessage = Layout != null ? Layout.Render(logEvent) : logEvent.FormattedMessage;
+            var renderedMessage = Layout != null ? RenderLogEvent(Layout, logEvent) : logEvent.FormattedMessage;
 
             object swCtxProperty;
             object tidProperty;
@@ -381,7 +388,9 @@ namespace NLog.Targets
 
             var swCtx = swCtxProperty != null ? swCtxProperty.ToString() : "N/A";
             var tid = tidProperty != null ? tidProperty.ToString() : "N/A";
-            var appName = appNameProperty != null ? appNameProperty.ToString() : this.AppName;
+            var appName = appNameProperty != null ? appNameProperty.ToString() : RenderLogEvent(this.AppName, logEvent);
+            var hostName = RenderLogEvent(this.HostName, logEvent);
+            var tagName = RenderLogEvent(this.Tag, logEvent);
             var threadName = System.Threading.Thread.CurrentThread.Name;
             if (string.IsNullOrEmpty(threadName))
             {
@@ -394,7 +403,7 @@ namespace NLog.Targets
             sb.Append("{");
             sb.AppendFormat("\"@timestamp\":\"{0}\",", logEvent.TimeStamp.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"));
             sb.Append("\"@version\":\"1\",");
-            sb.AppendFormat("\"hostname\":\"{0}\",", EscapeJson(Environment.MachineName));
+            sb.AppendFormat("\"hostname\":\"{0}\",", EscapeJson(hostName));
             sb.AppendFormat("\"appName\":\"{0}\",", EscapeJson(appName));
             sb.AppendFormat("\"level\":\"{0}\",", logEvent.Level.Name.ToUpper());
             sb.AppendFormat("\"level_value\":{0},", levelValue);
@@ -402,15 +411,15 @@ namespace NLog.Targets
             sb.AppendFormat("\"thread_name\":\"{0}\",", EscapeJson(threadName));
             sb.AppendFormat("\"message\":\"{0}\",", EscapeJson(renderedMessage));
             sb.AppendFormat("\"sequence_id\":{0},", logEvent.SequenceID);
-            sb.AppendFormat("\"tag\":\"{0}\"", EscapeJson(this.Tag));
+            sb.AppendFormat("\"tag\":\"{0}\"", EscapeJson(tagName));
 
             if (logEvent.Exception != null)
             {
                 sb.AppendFormat(",\"stack_trace\":\"{0}\"", EscapeJson(logEvent.Exception.ToString()));
             }
-            
+
             // Append extra properties if needed
-            if (this.IncludeAllProperties && logEvent.Properties.Count > 0)
+            if (this.IncludeAllProperties && logEvent.HasProperties)
             {
                 foreach (var property in logEvent.Properties)
                 {
@@ -435,7 +444,7 @@ namespace NLog.Targets
             catch (Exception ex)
             {
                 NLog.Common.InternalLogger.Warn("Fluentd Emit TCP JSON - " + ex.ToString());
-                throw; 
+                throw;
             }
         }
 
@@ -445,7 +454,6 @@ namespace NLog.Targets
             // Basic JSON escaping
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
         }
-
 
         private static int GetLevelValue(LogLevel level)
         {
@@ -464,9 +472,9 @@ namespace NLog.Targets
             return 0;
         }
 
-        private static object SerializePropertyValue(string propertyKey, object propertyValue)
+        private static object SerializePropertyValue(object propertyValue)
         {
-            if (propertyValue == null || Convert.GetTypeCode(propertyValue) != TypeCode.Object || propertyValue is decimal)
+            if (propertyValue == null || Convert.GetTypeCode(propertyValue) != TypeCode.Object)
             {
                 return propertyValue;   // immutable
             }
@@ -489,7 +497,10 @@ namespace NLog.Targets
             this.EmitStackTraceWhenAvailable = false;
             this.IncludeAllProperties = false;
             this.UseTcpJson = false;
-            this.Tag = Assembly.GetCallingAssembly().GetName().Name;
+            this.Layout = "${message}";
+            this.Tag = "${processname}";
+            this.AppName = "${processname}";
+            this.HostName = "${hostname}";
         }
     }
 }
